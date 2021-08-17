@@ -28,7 +28,7 @@ use std::{fs::File, io::Write};
 
 use lazy_static::lazy_static;
 use tempdir::TempDir;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, info, instrument};
 
 use crate::errors::{TmpPostgrustError, TmpPostgrustResult};
 
