@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 
-use tempdir::TempDir;
+use tempfile::TempDir;
 use tokio::io::Lines;
 use tokio::process::{ChildStderr, ChildStdout};
 

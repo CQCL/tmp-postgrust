@@ -28,7 +28,7 @@ use std::{fs::File, io::Write};
 
 use nix::unistd::{Gid, Uid, User};
 use once_cell::sync::Lazy;
-use tempdir::TempDir;
+use tempfile::{Builder, TempDir};
 use tracing::{debug, info, instrument};
 
 use crate::errors::{TmpPostgrustError, TmpPostgrustResult};
@@ -101,10 +101,14 @@ impl TmpPostgrustFactory {
     /// Try to create a new factory by creating temporary directories and the necessary config.
     #[instrument]
     pub fn try_new() -> TmpPostgrustResult<TmpPostgrustFactory> {
-        let socket_dir = TempDir::new("tmp-postgrust-socket")
+        let socket_dir = Builder::new()
+            .prefix("tmp-postgrust-socket")
+            .tempdir()
             .map_err(TmpPostgrustError::CreateSocketDirFailed)?;
-        let cache_dir =
-            TempDir::new("tmp-postgrust-cache").map_err(TmpPostgrustError::CreateCacheDirFailed)?;
+        let cache_dir = Builder::new()
+            .prefix("tmp-postgrust-cache")
+            .tempdir()
+            .map_err(TmpPostgrustError::CreateCacheDirFailed)?;
 
         synchronous::chown_to_non_root(cache_dir.path())?;
         synchronous::chown_to_non_root(socket_dir.path())?;
@@ -124,10 +128,14 @@ impl TmpPostgrustFactory {
     #[cfg(feature = "tokio-process")]
     #[instrument]
     pub async fn try_new_async() -> TmpPostgrustResult<TmpPostgrustFactory> {
-        let socket_dir = TempDir::new("tmp-postgrust-socket")
+        let socket_dir = Builder::new()
+            .prefix("tmp-postgrust-socket")
+            .tempdir()
             .map_err(TmpPostgrustError::CreateSocketDirFailed)?;
-        let cache_dir =
-            TempDir::new("tmp-postgrust-cache").map_err(TmpPostgrustError::CreateCacheDirFailed)?;
+        let cache_dir = Builder::new()
+            .prefix("tmp-postgrust-cache")
+            .tempdir()
+            .map_err(TmpPostgrustError::CreateCacheDirFailed)?;
 
         asynchronous::chown_to_non_root(cache_dir.path()).await?;
         asynchronous::chown_to_non_root(socket_dir.path()).await?;
@@ -146,8 +154,10 @@ impl TmpPostgrustFactory {
     /// up when dropped.
     #[instrument(skip(self))]
     pub fn new_instance(&self) -> TmpPostgrustResult<synchronous::ProcessGuard> {
-        let data_directory =
-            TempDir::new("tmp-postgrust-db").map_err(TmpPostgrustError::CreateCacheDirFailed)?;
+        let data_directory = Builder::new()
+            .prefix("tmp-postgrust-db")
+            .tempdir()
+            .map_err(TmpPostgrustError::CreateCacheDirFailed)?;
         let data_directory_path = data_directory.path();
 
         set_permissions(
@@ -230,8 +240,10 @@ impl TmpPostgrustFactory {
             .await
             .unwrap();
 
-        let data_directory =
-            TempDir::new("tmp-postgrust-db").map_err(TmpPostgrustError::CreateCacheDirFailed)?;
+        let data_directory = Builder::new()
+            .prefix("tmp-postgrust-db")
+            .tempdir()
+            .map_err(TmpPostgrustError::CreateCacheDirFailed)?;
         let data_directory_path = data_directory.path();
 
         set_permissions(
