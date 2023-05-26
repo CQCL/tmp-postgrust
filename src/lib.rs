@@ -26,19 +26,30 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::{fs::File, io::Write};
 
-use lazy_static::lazy_static;
+use nix::unistd::{Gid, Uid, User};
+use once_cell::sync::Lazy;
 use tempdir::TempDir;
 use tracing::{debug, info, instrument};
 
 use crate::errors::{TmpPostgrustError, TmpPostgrustResult};
 
+pub(crate) static POSTGRES_UID_GID: Lazy<(Uid, Gid)> = Lazy::new(|| {
+    User::from_name("postgres")
+        .ok()
+        .flatten()
+        .map(|u| (u.uid, u.gid))
+        .expect("no user `postgres` found is system")
+});
+
 /// Create a new default instance, initializing the `DEFAULT_POSTGRES_FACTORY` if it
 /// does not already exist.
+///
+/// # Errors
+///
+/// Will return `Err` if postgres is not installed on system
 pub fn new_default_process() -> TmpPostgrustResult<synchronous::ProcessGuard> {
-    lazy_static! {
-        static ref DEFAULT_POSTGRES_FACTORY: TmpPostgrustFactory =
-            TmpPostgrustFactory::try_new().unwrap();
-    }
+    static DEFAULT_POSTGRES_FACTORY: Lazy<TmpPostgrustFactory> =
+        Lazy::new(|| TmpPostgrustFactory::try_new().unwrap());
     DEFAULT_POSTGRES_FACTORY.new_instance()
 }
 
@@ -49,6 +60,10 @@ static TOKIO_POSTGRES_FACTORY: tokio::sync::OnceCell<TmpPostgrustFactory> =
 
 /// Create a new default instance, initializing the `TOKIO_POSTGRES_FACTORY` if it
 /// does not already exist.
+///
+/// # Errors
+///
+/// Will return `Err` if postgres is not installed on system
 #[cfg(feature = "tokio-process")]
 pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::ProcessGuard> {
     let factory = TOKIO_POSTGRES_FACTORY
@@ -91,7 +106,9 @@ impl TmpPostgrustFactory {
         let cache_dir =
             TempDir::new("tmp-postgrust-cache").map_err(TmpPostgrustError::CreateCacheDirFailed)?;
 
-        crate::synchronous::exec_init_db(cache_dir.path())?;
+        synchronous::chown_to_non_root(cache_dir.path())?;
+        synchronous::chown_to_non_root(socket_dir.path())?;
+        synchronous::exec_init_db(cache_dir.path())?;
 
         let config = TmpPostgrustFactory::build_config(socket_dir.path());
 
@@ -112,7 +129,9 @@ impl TmpPostgrustFactory {
         let cache_dir =
             TempDir::new("tmp-postgrust-cache").map_err(TmpPostgrustError::CreateCacheDirFailed)?;
 
-        crate::asynchronous::exec_init_db(cache_dir.path()).await?;
+        asynchronous::chown_to_non_root(cache_dir.path()).await?;
+        asynchronous::chown_to_non_root(socket_dir.path()).await?;
+        asynchronous::exec_init_db(cache_dir.path()).await?;
 
         let config = TmpPostgrustFactory::build_config(socket_dir.path());
 
@@ -151,6 +170,7 @@ impl TmpPostgrustFactory {
             .next_port
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        synchronous::chown_to_non_root(data_directory_path)?;
         let mut postgres_process_handle =
             synchronous::start_postgres_subprocess(data_directory_path, port)?;
         let stdout = postgres_process_handle.stdout.take().unwrap();
@@ -169,8 +189,8 @@ impl TmpPostgrustFactory {
         // TODO: Let users configure these
         let dbname = "demo";
         let dbuser = "demo";
-        synchronous::exec_create_user(&self.socket_dir.path(), port, dbname).unwrap();
-        synchronous::exec_create_db(&self.socket_dir.path(), port, dbname, dbuser).unwrap();
+        synchronous::exec_create_user(self.socket_dir.path(), port, dbname).unwrap();
+        synchronous::exec_create_db(self.socket_dir.path(), port, dbname, dbuser).unwrap();
 
         Ok(synchronous::ProcessGuard {
             stdout_reader: Some(stdout_reader),
@@ -235,6 +255,7 @@ impl TmpPostgrustFactory {
             .next_port
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        asynchronous::chown_to_non_root(data_directory_path).await?;
         let mut postgres_process_handle =
             asynchronous::start_postgres_subprocess(data_directory_path, port)?;
         let stdout = postgres_process_handle.stdout.take().unwrap();
@@ -247,7 +268,7 @@ impl TmpPostgrustFactory {
         tokio::spawn(async move {
             tokio::select! {
                 _ = postgres_process_handle.wait() => {
-                    error!("postgresql exited early");
+                    tracing::error!("postgresql exited early");
                 }
                 _ = recv => {
                     signal::kill(
@@ -270,10 +291,10 @@ impl TmpPostgrustFactory {
         // TODO: Let users configure these
         let dbname = "demo";
         let dbuser = "demo";
-        asynchronous::exec_create_user(&self.socket_dir.path(), port, dbname)
+        asynchronous::exec_create_user(self.socket_dir.path(), port, dbname)
             .await
             .unwrap();
-        asynchronous::exec_create_db(&self.socket_dir.path(), port, dbname, dbuser)
+        asynchronous::exec_create_db(self.socket_dir.path(), port, dbname, dbuser)
             .await
             .unwrap();
 
@@ -300,9 +321,9 @@ impl TmpPostgrustFactory {
 mod tests {
     use super::*;
 
-    use test_env_log::test;
-    use tokio::sync::OnceCell;
+    use test_log::test;
     use tokio_postgres::NoTls;
+    use tracing::error;
 
     #[test(tokio::test)]
     async fn it_works() {
@@ -325,6 +346,7 @@ mod tests {
         client.query("SELECT 1;", &[]).await.unwrap();
     }
 
+    #[cfg(feature = "tokio-process")]
     #[test(tokio::test)]
     async fn it_works_async() {
         let factory = TmpPostgrustFactory::try_new_async()
@@ -385,6 +407,7 @@ mod tests {
         client2.query("SELECT 1;", &[]).await.unwrap();
     }
 
+    #[cfg(feature = "tokio-process")]
     #[test(tokio::test)]
     async fn two_simulatenous_processes_async() {
         let factory = TmpPostgrustFactory::try_new_async()
@@ -425,8 +448,10 @@ mod tests {
         client2.query("SELECT 1;", &[]).await.unwrap();
     }
 
-    static FACTORY: OnceCell<TmpPostgrustFactory> = OnceCell::const_new();
+    #[cfg(feature = "tokio-process")]
+    static FACTORY: tokio::sync::OnceCell<TmpPostgrustFactory> = tokio::sync::OnceCell::const_new();
 
+    #[cfg(feature = "tokio-process")]
     #[test(tokio::test)]
     async fn static_oncecell() {
         let factory = FACTORY
@@ -467,8 +492,11 @@ mod tests {
     }
 
     // Test that a OnceCell can be used in two async tests.
-    static SHARED_FACTORY: OnceCell<TmpPostgrustFactory> = OnceCell::const_new();
+    #[cfg(feature = "tokio-process")]
+    static SHARED_FACTORY: tokio::sync::OnceCell<TmpPostgrustFactory> =
+        tokio::sync::OnceCell::const_new();
 
+    #[cfg(feature = "tokio-process")]
     #[test(tokio::test)]
     async fn static_oncecell_shared_1() {
         let factory = SHARED_FACTORY
@@ -491,6 +519,7 @@ mod tests {
         client.execute("CREATE TABLE lock ();", &[]).await.unwrap();
     }
 
+    #[cfg(feature = "tokio-process")]
     #[test(tokio::test)]
     async fn static_oncecell_shared_2() {
         let factory = SHARED_FACTORY
@@ -513,6 +542,7 @@ mod tests {
         client.execute("CREATE TABLE lock ();", &[]).await.unwrap();
     }
 
+    #[cfg(feature = "tokio-process")]
     #[test(tokio::test)]
     async fn default_process_factory_1() {
         let proc = new_default_process_async().await.unwrap();
@@ -531,6 +561,7 @@ mod tests {
         client.execute("CREATE TABLE lock ();", &[]).await.unwrap();
     }
 
+    #[cfg(feature = "tokio-process")]
     #[test(tokio::test)]
     async fn default_process_factory_2() {
         let proc = new_default_process_async().await.unwrap();
@@ -549,6 +580,7 @@ mod tests {
         client.execute("CREATE TABLE lock ();", &[]).await.unwrap();
     }
 
+    #[cfg(feature = "tokio-process")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn default_process_factory_multithread_1() {
         let proc = new_default_process_async().await.unwrap();
@@ -567,6 +599,7 @@ mod tests {
         client.execute("CREATE TABLE lock ();", &[]).await.unwrap();
     }
 
+    #[cfg(feature = "tokio-process")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn default_process_factory_multithread_2() {
         let proc = new_default_process_async().await.unwrap();

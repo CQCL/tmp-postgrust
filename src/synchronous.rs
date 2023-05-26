@@ -1,6 +1,7 @@
 use std::convert::TryInto;
 use std::io::BufReader;
 use std::io::Lines;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Child;
 use std::process::ChildStderr;
@@ -11,12 +12,13 @@ use std::sync::Arc;
 
 use nix::sys::signal;
 use nix::sys::signal::Signal;
-use nix::unistd::Pid;
+use nix::unistd::{Pid, Uid};
 use tempdir::TempDir;
 use tracing::{debug, instrument};
 
 use crate::errors::{ProcessCapture, TmpPostgrustError, TmpPostgrustResult};
 use crate::search::find_postgresql_command;
+use crate::POSTGRES_UID_GID;
 
 #[instrument(skip(command, fail))]
 fn exec_process(
@@ -29,7 +31,7 @@ fn exec_process(
         .output()
         .map_err(|err| TmpPostgrustError::ExecSubprocessFailed {
             source: err,
-            command: format!("{:?}", command),
+            command: format!("{command:?}"),
         })?;
 
     if output.status.success() {
@@ -53,12 +55,15 @@ pub(crate) fn start_postgres_subprocess(
     let postgres_path =
         find_postgresql_command("bin", "postgres").expect("failed to find postgres");
 
-    Command::new(postgres_path)
+    let mut command = Command::new(postgres_path);
+    command
         .env("PGDATA", data_directory.to_str().unwrap())
         .arg("-p")
         .arg(port.to_string())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd_as_non_root(&mut command);
+    command
         .spawn()
         .map_err(TmpPostgrustError::SpawnSubprocessFailed)
 }
@@ -68,12 +73,13 @@ pub(crate) fn exec_init_db(data_directory: &'_ Path) -> TmpPostgrustResult<()> {
     let initdb_path = find_postgresql_command("bin", "initdb").expect("failed to find initdb");
 
     debug!("Initializing database in: {:?}", data_directory);
-    exec_process(
-        &mut Command::new(initdb_path)
-            .env("PGDATA", data_directory.to_str().unwrap())
-            .arg("--username=postgres"),
-        TmpPostgrustError::InitDBFailed,
-    )
+
+    let mut command = Command::new(initdb_path);
+    command
+        .env("PGDATA", data_directory.to_str().unwrap())
+        .arg("--username=postgres");
+    cmd_as_non_root(&mut command);
+    exec_process(&mut command, TmpPostgrustError::InitDBFailed)
 }
 
 #[instrument]
@@ -83,26 +89,36 @@ pub(crate) fn exec_copy_dir(src_dir: &'_ Path, dst_dir: &'_ Path) -> TmpPostgrus
         .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?
     {
         let mut cmd = Command::new("cp");
+        cmd.arg("-R");
+
         #[cfg(target_os = "macos")]
-        cmd.arg("-R")
-            .arg("-c")
-            .arg(
-                read_dir
-                    .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?
-                    .path(),
-            )
-            .arg(dst_dir);
-        #[cfg(not(target_os = "macos"))]
-        cmd.arg("-R")
-            .arg("--reflink=auto")
-            .arg(
-                read_dir
-                    .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?
-                    .path(),
-            )
-            .arg(dst_dir);
+        cmd.arg("-c");
+        #[cfg(target_os = "linux")]
+        cmd.arg("--reflink=auto");
+
+        cmd.arg(
+            read_dir
+                .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?
+                .path(),
+        )
+        .arg(dst_dir);
+
         exec_process(&mut cmd, TmpPostgrustError::CopyCachedInitDBFailed)?;
     }
+    Ok(())
+}
+
+#[instrument]
+pub(crate) fn chown_to_non_root(dir: &Path) -> TmpPostgrustResult<()> {
+    let current_uid = Uid::effective();
+    if !current_uid.is_root() {
+        return Ok(());
+    }
+
+    let (uid, gid) = &*POSTGRES_UID_GID;
+    let mut cmd = Command::new("chown");
+    cmd.arg("-R").arg(format!("{uid}:{gid}")).arg(dir);
+    exec_process(&mut cmd, TmpPostgrustError::UpdatingPermissionsFailed)?;
     Ok(())
 }
 
@@ -113,20 +129,20 @@ pub(crate) fn exec_create_db(
     owner: &'_ str,
     dbname: &'_ str,
 ) -> TmpPostgrustResult<()> {
-    exec_process(
-        &mut Command::new("createdb")
-            .arg("-h")
-            .arg(socket)
-            .arg("-p")
-            .arg(port.to_string())
-            .arg("-U")
-            .arg("postgres")
-            .arg("-O")
-            .arg(owner)
-            .arg("--echo")
-            .arg(dbname),
-        TmpPostgrustError::CreateDBFailed,
-    )
+    let mut command = Command::new("createdb");
+    command
+        .arg("-h")
+        .arg(socket)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-U")
+        .arg("postgres")
+        .arg("-O")
+        .arg(owner)
+        .arg("--echo")
+        .arg(dbname);
+    cmd_as_non_root(&mut command);
+    exec_process(&mut command, TmpPostgrustError::CreateDBFailed)
 }
 
 #[instrument]
@@ -135,22 +151,22 @@ pub(crate) fn exec_create_user(
     port: u32,
     username: &'_ str,
 ) -> TmpPostgrustResult<()> {
-    exec_process(
-        &mut Command::new("createuser")
-            .arg("-h")
-            .arg(socket)
-            .arg("-p")
-            .arg(port.to_string())
-            .arg("-U")
-            .arg("postgres")
-            .arg("--superuser")
-            .arg("--echo")
-            .arg(username),
-        TmpPostgrustError::CreateDBFailed,
-    )
+    let mut command = Command::new("createuser");
+    command
+        .arg("-h")
+        .arg(socket)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("-U")
+        .arg("postgres")
+        .arg("--superuser")
+        .arg("--echo")
+        .arg(username);
+    cmd_as_non_root(&mut command);
+    exec_process(&mut command, TmpPostgrustError::CreateDBFailed)
 }
 
-/// ProcessGuard represents a postgresql process that is running in the background.
+/// `ProcessGuard` represents a postgresql process that is running in the background.
 /// once the guard is dropped the process will be killed.
 pub struct ProcessGuard {
     /// Allows users to read stdout by line for debugging.
@@ -179,5 +195,14 @@ impl Drop for ProcessGuard {
         )
         .unwrap();
         self.postgres_process.wait().unwrap();
+    }
+}
+
+fn cmd_as_non_root(command: &mut Command) {
+    let current_uid = Uid::effective();
+    if current_uid.is_root() {
+        let (user_id, group_id) = &*POSTGRES_UID_GID;
+        // PostgreSQL cannot be run as root, so change to default user
+        command.uid(user_id.as_raw()).gid(group_id.as_raw());
     }
 }
