@@ -13,7 +13,7 @@ use std::sync::Arc;
 use nix::sys::signal;
 use nix::sys::signal::Signal;
 use nix::unistd::{Pid, Uid};
-use tempdir::TempDir;
+use tempfile::TempDir;
 use tracing::{debug, instrument};
 
 use crate::errors::{ProcessCapture, TmpPostgrustError, TmpPostgrustResult};

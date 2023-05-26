@@ -1,6 +1,6 @@
 [package]
 name = "tmp-postgrust"
-version = "0.5.1"
+version = "0.6.0"
 authors = ["John Children <john.children@cambridgequantum.com>"]
 license = "MIT"
 edition = "2018"
@@ -15,7 +15,7 @@ maintenance = { status = "experimental" }
 [dependencies]
 glob = "0.3"
 nix = "0.26"
-tempdir = "0.3"
+tempfile = "3"
 thiserror = "1.0"
 tokio = { version = "1.8", features = ["parking_lot", "rt", "sync", "io-util", "process", "macros", "fs"], default-features = false, optional = true }
 tracing = "0.1"
