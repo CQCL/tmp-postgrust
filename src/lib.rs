@@ -206,12 +206,11 @@ impl TmpPostgrustFactory {
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
             connection_string: format!(
-                "postgresql://{}@{}:{}/{}?host={}",
-                dbuser,
-                "localhost",
+                "postgresql:///?host={}&port={}&dbname={}&user={}",
+                self.socket_dir.path().to_str().unwrap(),
                 port,
                 dbname,
-                self.socket_dir.path().to_str().unwrap()
+                dbuser,
             ),
             postgres_process: postgres_process_handle,
             _data_directory: data_directory,
@@ -314,12 +313,11 @@ impl TmpPostgrustFactory {
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
             connection_string: format!(
-                "postgresql://{}@{}:{}/{}?host={}",
-                dbuser,
-                "localhost",
+                "postgresql:///?host={}&port={}&dbname={}&user={}",
+                self.socket_dir.path().to_str().unwrap(),
                 port,
                 dbname,
-                self.socket_dir.path().to_str().unwrap()
+                dbuser,
             ),
             send_done: Some(send),
             _data_directory: data_directory,
