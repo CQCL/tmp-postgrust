@@ -27,12 +27,15 @@ pub enum TmpPostgrustError {
     /// Error when `initdb` fails to execute.
     #[error("initdb failed")]
     InitDBFailed(ProcessCapture),
-    /// Error when `cp` fails for the initialized database.
-    #[error("copying cached database failed")]
-    CopyCachedInitDBFailed(ProcessCapture),
     /// Error when a file to be copied is not found.
     #[error("copying cached database failed, file not found")]
     CopyCachedInitDBFailedFileNotFound(#[source] std::io::Error),
+    /// Error when the file type cannot be read when copying the cached db.
+    #[error("copying cached database failed, could not read file type")]
+    CopyCachedInitDBFailedCouldNotReadFileType(#[source] std::io::Error),
+    /// Error when the source directory filepath cannot be stripped.
+    #[error("copying cached database failed, could not strip path prefix")]
+    CopyCachedInitDBFailedCouldNotStripPathPrefix(#[source] std::path::StripPrefixError),
     /// Error when a copy process cannot be joined.
     #[cfg(feature = "tokio-process")]
     #[error("copying cached database failed, failed to join cp process")]
