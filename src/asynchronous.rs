@@ -4,9 +4,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use tempfile::TempDir;
+use tokio::fs::create_dir_all;
 use tokio::io::Lines;
 use tokio::process::{ChildStderr, ChildStdout};
-
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::{
@@ -16,7 +16,7 @@ use tokio::{
 use tracing::{debug, instrument};
 
 use crate::errors::{ProcessCapture, TmpPostgrustError, TmpPostgrustResult};
-use crate::search::find_postgresql_command;
+use crate::search::{all_dir_entries, build_copy_dst_path, find_postgresql_command};
 use crate::POSTGRES_UID_GID;
 
 /// Limit the total processes that can be running at any one time.
@@ -52,7 +52,7 @@ async fn exec_process(
 
 #[instrument]
 pub(crate) fn start_postgres_subprocess(
-    data_directory: &'_ Path,
+    data_directory: &Path,
     port: u32,
 ) -> TmpPostgrustResult<Child> {
     let postgres_path =
@@ -72,7 +72,7 @@ pub(crate) fn start_postgres_subprocess(
 }
 
 #[instrument]
-pub(crate) async fn exec_init_db(data_directory: &'_ Path) -> TmpPostgrustResult<()> {
+pub(crate) async fn exec_init_db(data_directory: &Path) -> TmpPostgrustResult<()> {
     let initdb_path = find_postgresql_command("bin", "initdb").expect("failed to find initdb");
 
     debug!("Initializing database in: {:?}", data_directory);
@@ -85,37 +85,29 @@ pub(crate) async fn exec_init_db(data_directory: &'_ Path) -> TmpPostgrustResult
 }
 
 #[instrument]
-pub(crate) async fn exec_copy_dir(src_dir: &'_ Path, dst_dir: &'_ Path) -> TmpPostgrustResult<()> {
-    for read_dir in src_dir
-        .read_dir()
-        .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?
-    {
-        let mut cmd = Command::new("cp");
-        cmd.arg("-R");
+pub(crate) async fn exec_copy_dir(src_dir: &Path, dst_dir: &Path) -> TmpPostgrustResult<()> {
+    let (dirs, others) = all_dir_entries(src_dir)?;
 
-        #[cfg(target_os = "macos")]
-        cmd.arg("-c");
-        #[cfg(target_os = "linux")]
-        cmd.arg("--reflink=auto");
-
-        cmd.arg(
-            read_dir
-                .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?
-                .path(),
-        )
-        .arg(dst_dir);
-
-        exec_process(&mut cmd, TmpPostgrustError::CopyCachedInitDBFailed).await?;
+    for entry in dirs {
+        create_dir_all(build_copy_dst_path(&entry, src_dir, dst_dir)?)
+            .await
+            .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?;
     }
+
+    for entry in others {
+        reflink_copy::reflink_or_copy(&entry, build_copy_dst_path(&entry, src_dir, dst_dir)?)
+            .map_err(TmpPostgrustError::CopyCachedInitDBFailedFileNotFound)?;
+    }
+
     Ok(())
 }
 
 #[instrument]
 pub(crate) async fn exec_create_db(
-    socket: &'_ Path,
+    socket: &Path,
     port: u32,
-    owner: &'_ str,
-    dbname: &'_ str,
+    owner: &str,
+    dbname: &str,
 ) -> TmpPostgrustResult<()> {
     let mut command = Command::new("createdb");
     command
@@ -135,9 +127,9 @@ pub(crate) async fn exec_create_db(
 
 #[instrument]
 pub(crate) async fn exec_create_user(
-    socket: &'_ Path,
+    socket: &Path,
     port: u32,
-    username: &'_ str,
+    username: &str,
 ) -> TmpPostgrustResult<()> {
     let mut command = Command::new("createuser");
     command
