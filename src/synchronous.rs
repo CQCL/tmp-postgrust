@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use nix::sys::signal;
 use nix::sys::signal::Signal;
+use nix::unistd::User;
 use nix::unistd::{Pid, Uid};
 use tempfile::TempDir;
 use tracing::{debug, instrument};
@@ -109,7 +110,13 @@ pub(crate) fn chown_to_non_root(dir: &Path) -> TmpPostgrustResult<()> {
         return Ok(());
     }
 
-    let (uid, gid) = &*POSTGRES_UID_GID;
+    let (uid, gid) = POSTGRES_UID_GID.get_or_init(|| {
+        User::from_name("postgres")
+            .ok()
+            .flatten()
+            .map(|u| (u.uid, u.gid))
+            .expect("no user `postgres` found is system")
+    });
     let mut cmd = Command::new("chown");
     cmd.arg("-R").arg(format!("{uid}:{gid}")).arg(dir);
     exec_process(&mut cmd, TmpPostgrustError::UpdatingPermissionsFailed)?;
@@ -191,8 +198,15 @@ impl Drop for ProcessGuard {
 fn cmd_as_non_root(command: &mut Command) {
     let current_uid = Uid::effective();
     if current_uid.is_root() {
-        let (user_id, group_id) = &*POSTGRES_UID_GID;
+        let (uid, gid) = POSTGRES_UID_GID.get_or_init(|| {
+            User::from_name("postgres")
+                .ok()
+                .flatten()
+                .map(|u| (u.uid, u.gid))
+                .expect("no user `postgres` found is system")
+        });
+        command.uid(uid.as_raw()).gid(gid.as_raw());
         // PostgreSQL cannot be run as root, so change to default user
-        command.uid(user_id.as_raw()).gid(group_id.as_raw());
+        command.uid(uid.as_raw()).gid(gid.as_raw());
     }
 }
