@@ -1,4 +1,4 @@
-use nix::unistd::Uid;
+use nix::unistd::{Uid, User};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -153,7 +153,13 @@ pub(crate) async fn chown_to_non_root(dir: &Path) -> TmpPostgrustResult<()> {
         return Ok(());
     }
 
-    let (uid, gid) = &*POSTGRES_UID_GID;
+    let (uid, gid) = POSTGRES_UID_GID.get_or_init(|| {
+        User::from_name("postgres")
+            .ok()
+            .flatten()
+            .map(|u| (u.uid, u.gid))
+            .expect("no user `postgres` found is system")
+    });
     let mut cmd = Command::new("chown");
     cmd.arg("-R").arg(format!("{uid}:{gid}")).arg(dir);
     exec_process(&mut cmd, TmpPostgrustError::UpdatingPermissionsFailed).await
@@ -196,7 +202,13 @@ fn cmd_as_non_root(command: &mut Command) {
     let current_uid = Uid::effective();
     if current_uid.is_root() {
         // PostgreSQL cannot be run as root, so change to default user
-        let (user_id, group_id) = &*POSTGRES_UID_GID;
-        command.uid(user_id.as_raw()).gid(group_id.as_raw());
+        let (uid, gid) = POSTGRES_UID_GID.get_or_init(|| {
+            User::from_name("postgres")
+                .ok()
+                .flatten()
+                .map(|u| (u.uid, u.gid))
+                .expect("no user `postgres` found is system")
+        });
+        command.uid(uid.as_raw()).gid(gid.as_raw());
     }
 }
