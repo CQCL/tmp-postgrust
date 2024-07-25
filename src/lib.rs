@@ -33,6 +33,9 @@ use tracing::{debug, info, instrument};
 
 use crate::errors::{TmpPostgrustError, TmpPostgrustResult};
 
+const TMP_POSTGRUST_DB_NAME: &'static str = "tmp-postgrust";
+const TMP_POSTGRUST_USER_NAME: &'static str = "tmp-postgrust-user";
+
 pub(crate) static POSTGRES_UID_GID: OnceLock<(Uid, Gid)> = OnceLock::new();
 
 /// As the static variables declared by this crate contain values that
@@ -77,6 +80,34 @@ pub fn new_default_process() -> TmpPostgrustResult<synchronous::ProcessGuard> {
     factory.new_instance()
 }
 
+/// Create a new default instance, initializing the `DEFAULT_POSTGRES_FACTORY` if it
+/// does not already exist. The function passed as the `migrate` parameters
+/// will be run the first time the factory is initialised.
+///
+/// # Errors
+///
+/// Will return `Err` if postgres is not installed on system
+pub fn new_default_process_with_migrations(
+    migrate: impl Fn(&str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+) -> TmpPostgrustResult<synchronous::ProcessGuard> {
+    let factory_mutex = DEFAULT_POSTGRES_FACTORY.get_or_init(|| {
+        let factory =
+            TmpPostgrustFactory::try_new().expect("Failed to initialize default postgres factory.");
+        factory
+            .run_migrations(migrate)
+            .expect("Failed to run migrations");
+
+        Mutex::new(Some(factory))
+    });
+    let guard = factory_mutex
+        .lock()
+        .expect("Failed to lock default factory mutex.");
+    let factory = guard
+        .as_ref()
+        .expect("Default factory is uninitialized or has been dropped.");
+    factory.new_instance()
+}
+
 /// Static factory that can be re-used between tests.
 #[cfg(feature = "tokio-process")]
 static TOKIO_POSTGRES_FACTORY: tokio::sync::OnceCell<
@@ -105,11 +136,39 @@ pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::Pro
     factory.new_instance_async().await
 }
 
+/// Create a new default instance, initializing the `TOKIO_POSTGRES_FACTORY` if it
+/// does not already exist. The function passed as the `migrate` parameters
+/// will be run the first time the factory is initialised.
+///
+/// # Errors
+///
+/// Will return `Err` if postgres is not installed on system
+#[cfg(feature = "tokio-process")]
+pub async fn new_default_process_async_with_migrations(
+    migrate: impl Fn(&str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+) -> TmpPostgrustResult<asynchronous::ProcessGuard> {
+    let factory_mutex = TOKIO_POSTGRES_FACTORY
+        .get_or_try_init(|| async {
+            TmpPostgrustFactory::try_new_async().await.map(|factory| {
+                factory
+                    .run_migrations(migrate)
+                    .expect("Failed to run migrations.");
+                tokio::sync::Mutex::new(Some(factory))
+            })
+        })
+        .await?;
+    let guard = factory_mutex.lock().await;
+    let factory = guard
+        .as_ref()
+        .expect("Default tokio factory is uninitialized or has been dropped.");
+    factory.new_instance_async().await
+}
+
 /// Factory for creating new temporary postgresql processes.
 #[derive(Debug)]
 pub struct TmpPostgrustFactory {
     socket_dir: Arc<TempDir>,
-    cache_dir: TempDir,
+    cache_dir: Arc<TempDir>,
     config: String,
     next_port: AtomicU32,
 }
@@ -151,7 +210,7 @@ impl TmpPostgrustFactory {
 
         Ok(TmpPostgrustFactory {
             socket_dir: Arc::new(socket_dir),
-            cache_dir,
+            cache_dir: Arc::new(cache_dir),
             config,
             next_port: AtomicU32::new(5432),
         })
@@ -178,11 +237,26 @@ impl TmpPostgrustFactory {
 
         Ok(TmpPostgrustFactory {
             socket_dir: Arc::new(socket_dir),
-            cache_dir,
+            cache_dir: Arc::new(cache_dir),
             config,
             next_port: AtomicU32::new(5432),
         })
     }
+
+    /// Run migrations against the cache directory, will cause all subsequent instances
+    /// to be run against a version of the database where the migrations have been applied.
+    pub fn run_migrations(
+        &self,
+        migrate: impl FnOnce(&str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    ) -> TmpPostgrustResult<()> {
+        let process = self.start_postgresql(&self.cache_dir)?;
+
+        migrate(&process.connection_string)
+            .map_err(|err| TmpPostgrustError::MigrationsFailed(err))?;
+
+        Ok(())
+    }
+
     /// Start a new postgresql instance and return a process guard that will ensure it is cleaned
     /// up when dropped.
     #[instrument(skip(self))]
@@ -204,7 +278,17 @@ impl TmpPostgrustFactory {
             return Err(TmpPostgrustError::EmptyDataDirectory);
         };
 
-        File::create(data_directory_path.join("postgresql.conf"))
+        self.start_postgresql(&Arc::new(data_directory))
+    }
+
+    /// Start a new postgresql instance and return a process guard that will ensure it is cleaned
+    /// up when dropped.
+    #[instrument(skip(self))]
+    fn start_postgresql(
+        &self,
+        dir: &Arc<TempDir>,
+    ) -> TmpPostgrustResult<synchronous::ProcessGuard> {
+        File::create(dir.path().join("postgresql.conf"))
             .map_err(TmpPostgrustError::CreateConfigFailed)?
             .write_all(self.config.as_bytes())
             .map_err(TmpPostgrustError::CreateConfigFailed)?;
@@ -213,9 +297,8 @@ impl TmpPostgrustFactory {
             .next_port
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        synchronous::chown_to_non_root(data_directory_path)?;
-        let mut postgres_process_handle =
-            synchronous::start_postgres_subprocess(data_directory_path, port)?;
+        synchronous::chown_to_non_root(dir.path())?;
+        let mut postgres_process_handle = synchronous::start_postgres_subprocess(dir.path(), port)?;
         let stdout = postgres_process_handle.stdout.take().unwrap();
         let stderr = postgres_process_handle.stderr.take().unwrap();
 
@@ -229,11 +312,14 @@ impl TmpPostgrustFactory {
                 break;
             }
         }
-        // TODO: Let users configure these
-        let dbname = "demo";
-        let dbuser = "demo";
-        synchronous::exec_create_user(self.socket_dir.path(), port, dbname).unwrap();
-        synchronous::exec_create_db(self.socket_dir.path(), port, dbname, dbuser).unwrap();
+        synchronous::exec_create_user(self.socket_dir.path(), port, TMP_POSTGRUST_DB_NAME).unwrap();
+        synchronous::exec_create_db(
+            self.socket_dir.path(),
+            port,
+            TMP_POSTGRUST_DB_NAME,
+            TMP_POSTGRUST_USER_NAME,
+        )
+        .unwrap();
 
         Ok(synchronous::ProcessGuard {
             stdout_reader: Some(stdout_reader),
@@ -242,11 +328,11 @@ impl TmpPostgrustFactory {
                 "postgresql:///?host={}&port={}&dbname={}&user={}",
                 self.socket_dir.path().to_str().unwrap(),
                 port,
-                dbname,
-                dbuser,
+                TMP_POSTGRUST_DB_NAME,
+                TMP_POSTGRUST_USER_NAME,
             ),
             postgres_process: postgres_process_handle,
-            _data_directory: data_directory,
+            _data_directory: Arc::clone(dir),
             _socket_dir: Arc::clone(&self.socket_dir),
         })
     }
@@ -332,15 +418,17 @@ impl TmpPostgrustFactory {
                 break;
             }
         }
-        // TODO: Let users configure these
-        let dbname = "demo";
-        let dbuser = "demo";
-        asynchronous::exec_create_user(self.socket_dir.path(), port, dbname)
+        asynchronous::exec_create_user(self.socket_dir.path(), port, TMP_POSTGRUST_DB_NAME)
             .await
             .unwrap();
-        asynchronous::exec_create_db(self.socket_dir.path(), port, dbname, dbuser)
-            .await
-            .unwrap();
+        asynchronous::exec_create_db(
+            self.socket_dir.path(),
+            port,
+            TMP_POSTGRUST_DB_NAME,
+            TMP_POSTGRUST_USER_NAME,
+        )
+        .await
+        .unwrap();
 
         Ok(asynchronous::ProcessGuard {
             stdout_reader: Some(stdout_reader),
@@ -349,8 +437,8 @@ impl TmpPostgrustFactory {
                 "postgresql:///?host={}&port={}&dbname={}&user={}",
                 self.socket_dir.path().to_str().unwrap(),
                 port,
-                dbname,
-                dbuser,
+                TMP_POSTGRUST_DB_NAME,
+                TMP_POSTGRUST_USER_NAME,
             ),
             send_done: Some(send),
             _data_directory: data_directory,

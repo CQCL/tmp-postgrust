@@ -58,6 +58,9 @@ pub enum TmpPostgrustError {
     /// Error when `cp` fails for the initialized database.
     #[error("updating directory permission to non-root failed")]
     UpdatingPermissionsFailed(ProcessCapture),
+    /// Error when running migrations failed.
+    #[error("failed to run database migrations")]
+    MigrationsFailed(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// Result type for `TmpPostgrustError`, used by functions in this crate.
