@@ -177,7 +177,7 @@ pub struct ProcessGuard {
     pub(crate) postgres_process: Child,
     // Prevent the data directory from being dropped while
     // the process is running.
-    pub(crate) _data_directory: TempDir,
+    pub(crate) _data_directory: Arc<TempDir>,
     // Prevent socket directory from being dropped while
     // the process is running.
     pub(crate) _socket_dir: Arc<TempDir>,
