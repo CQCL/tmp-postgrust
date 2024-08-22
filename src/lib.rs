@@ -33,8 +33,8 @@ use tracing::{debug, info, instrument};
 
 use crate::errors::{TmpPostgrustError, TmpPostgrustResult};
 
-const TMP_POSTGRUST_DB_NAME: &'static str = "tmp-postgrust";
-const TMP_POSTGRUST_USER_NAME: &'static str = "tmp-postgrust-user";
+const TMP_POSTGRUST_DB_NAME: &str = "tmp-postgrust";
+const TMP_POSTGRUST_USER_NAME: &str = "tmp-postgrust-user";
 
 pub(crate) static POSTGRES_UID_GID: OnceLock<(Uid, Gid)> = OnceLock::new();
 
@@ -65,6 +65,11 @@ static DEFAULT_POSTGRES_FACTORY: OnceLock<Mutex<Option<TmpPostgrustFactory>>> = 
 /// # Errors
 ///
 /// Will return `Err` if postgres is not installed on system
+///
+/// # Panics
+///
+/// Will panic if a `TmpPostgrustFactory::try_new` returns an error the first time the function
+/// is called.
 pub fn new_default_process() -> TmpPostgrustResult<synchronous::ProcessGuard> {
     let factory_mutex = DEFAULT_POSTGRES_FACTORY.get_or_init(|| {
         Mutex::new(Some(
@@ -87,6 +92,11 @@ pub fn new_default_process() -> TmpPostgrustResult<synchronous::ProcessGuard> {
 /// # Errors
 ///
 /// Will return `Err` if postgres is not installed on system
+///
+/// # Panics
+///
+/// Will panic if a `TmpPostgrustFactory::try_new` returns an error the first time the function
+/// is called.
 pub fn new_default_process_with_migrations(
     migrate: impl Fn(&str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
 ) -> TmpPostgrustResult<synchronous::ProcessGuard> {
@@ -120,6 +130,11 @@ static TOKIO_POSTGRES_FACTORY: tokio::sync::OnceCell<
 /// # Errors
 ///
 /// Will return `Err` if postgres is not installed on system
+///
+/// # Panics
+///
+/// Will panic if a `TmpPostgrustFactory::try_new_async` returns an error the first time the function
+/// is called.
 #[cfg(feature = "tokio-process")]
 pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::ProcessGuard> {
     let factory_mutex = TOKIO_POSTGRES_FACTORY
@@ -143,6 +158,11 @@ pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::Pro
 /// # Errors
 ///
 /// Will return `Err` if postgres is not installed on system
+///
+/// # Panics
+///
+/// Will panic if a `TmpPostgrustFactory::try_new_async` returns an error the first time the function
+/// is called.
 #[cfg(feature = "tokio-process")]
 pub async fn new_default_process_async_with_migrations(
     migrate: impl Fn(&str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
@@ -208,12 +228,22 @@ impl TmpPostgrustFactory {
 
         let config = TmpPostgrustFactory::build_config(socket_dir.path());
 
-        Ok(TmpPostgrustFactory {
+        let factory = TmpPostgrustFactory {
             socket_dir: Arc::new(socket_dir),
             cache_dir: Arc::new(cache_dir),
             config,
             next_port: AtomicU32::new(5432),
-        })
+        };
+        let process = factory.start_postgresql(&factory.cache_dir)?;
+        synchronous::exec_create_user(process.socket_dir.path(), process.port, &process.user_name)?;
+        synchronous::exec_create_db(
+            process.socket_dir.path(),
+            process.port,
+            &process.user_name,
+            &process.db_name,
+        )?;
+
+        Ok(factory)
     }
 
     /// Try to create a new factory by creating temporary directories and the necessary config.
@@ -235,24 +265,40 @@ impl TmpPostgrustFactory {
 
         let config = TmpPostgrustFactory::build_config(socket_dir.path());
 
-        Ok(TmpPostgrustFactory {
+        let factory = TmpPostgrustFactory {
             socket_dir: Arc::new(socket_dir),
             cache_dir: Arc::new(cache_dir),
             config,
             next_port: AtomicU32::new(5432),
-        })
+        };
+        let process = factory.start_postgresql_async(&factory.cache_dir).await?;
+        asynchronous::exec_create_user(process.socket_dir.path(), process.port, &process.user_name)
+            .await?;
+        asynchronous::exec_create_db(
+            process.socket_dir.path(),
+            process.port,
+            &process.user_name,
+            &process.db_name,
+        )
+        .await?;
+
+        Ok(factory)
     }
 
     /// Run migrations against the cache directory, will cause all subsequent instances
     /// to be run against a version of the database where the migrations have been applied.
+    ///
+    /// # Errors
+    ///
+    /// Will error if Postgresql is unable to start or if the migrate function returns
+    /// an error.
     pub fn run_migrations(
         &self,
         migrate: impl FnOnce(&str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     ) -> TmpPostgrustResult<()> {
         let process = self.start_postgresql(&self.cache_dir)?;
 
-        migrate(&process.connection_string)
-            .map_err(|err| TmpPostgrustError::MigrationsFailed(err))?;
+        migrate(&process.connection_string()).map_err(TmpPostgrustError::MigrationsFailed)?;
 
         Ok(())
     }
@@ -264,7 +310,7 @@ impl TmpPostgrustFactory {
         let data_directory = Builder::new()
             .prefix("tmp-postgrust-db")
             .tempdir()
-            .map_err(TmpPostgrustError::CreateCacheDirFailed)?;
+            .map_err(TmpPostgrustError::CreateDataDirFailed)?;
         let data_directory_path = data_directory.path();
 
         set_permissions(
@@ -281,8 +327,6 @@ impl TmpPostgrustFactory {
         self.start_postgresql(&Arc::new(data_directory))
     }
 
-    /// Start a new postgresql instance and return a process guard that will ensure it is cleaned
-    /// up when dropped.
     #[instrument(skip(self))]
     fn start_postgresql(
         &self,
@@ -312,28 +356,17 @@ impl TmpPostgrustFactory {
                 break;
             }
         }
-        synchronous::exec_create_user(self.socket_dir.path(), port, TMP_POSTGRUST_DB_NAME).unwrap();
-        synchronous::exec_create_db(
-            self.socket_dir.path(),
-            port,
-            TMP_POSTGRUST_DB_NAME,
-            TMP_POSTGRUST_USER_NAME,
-        )
-        .unwrap();
 
         Ok(synchronous::ProcessGuard {
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
-            connection_string: format!(
-                "postgresql:///?host={}&port={}&dbname={}&user={}",
-                self.socket_dir.path().to_str().unwrap(),
-                port,
-                TMP_POSTGRUST_DB_NAME,
-                TMP_POSTGRUST_USER_NAME,
-            ),
+            port,
+            db_name: TMP_POSTGRUST_DB_NAME.to_string(),
+            user_name: TMP_POSTGRUST_USER_NAME.to_string(),
             postgres_process: postgres_process_handle,
             _data_directory: Arc::clone(dir),
-            _socket_dir: Arc::clone(&self.socket_dir),
+            _cache_directory: Arc::clone(&self.cache_dir),
+            socket_dir: Arc::clone(&self.socket_dir),
         })
     }
 
@@ -342,26 +375,12 @@ impl TmpPostgrustFactory {
     #[cfg(feature = "tokio-process")]
     #[instrument(skip(self))]
     pub async fn new_instance_async(&self) -> TmpPostgrustResult<asynchronous::ProcessGuard> {
-        use std::convert::TryInto;
-
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid;
-        use tokio::io::AsyncBufReadExt;
-        use tokio::sync::oneshot;
-        use tokio::{
-            fs::{metadata, set_permissions},
-            io::BufReader,
-        };
-
-        let process_permit = asynchronous::MAX_CONCURRENT_PROCESSES
-            .acquire()
-            .await
-            .unwrap();
+        use tokio::fs::{metadata, set_permissions};
 
         let data_directory = Builder::new()
             .prefix("tmp-postgrust-db")
             .tempdir()
-            .map_err(TmpPostgrustError::CreateCacheDirFailed)?;
+            .map_err(TmpPostgrustError::CreateDataDirFailed)?;
         let data_directory_path = data_directory.path();
 
         set_permissions(
@@ -376,7 +395,23 @@ impl TmpPostgrustFactory {
             return Err(TmpPostgrustError::EmptyDataDirectory);
         };
 
-        File::create(data_directory_path.join("postgresql.conf"))
+        self.start_postgresql_async(&Arc::new(data_directory)).await
+    }
+
+    #[cfg(feature = "tokio-process")]
+    #[instrument(skip(self))]
+    async fn start_postgresql_async(
+        &self,
+        dir: &Arc<TempDir>,
+    ) -> TmpPostgrustResult<asynchronous::ProcessGuard> {
+        use tokio::io::AsyncBufReadExt;
+
+        let process_permit = asynchronous::MAX_CONCURRENT_PROCESSES
+            .acquire()
+            .await
+            .unwrap();
+
+        File::create(dir.path().join("postgresql.conf"))
             .map_err(TmpPostgrustError::CreateConfigFailed)?
             .write_all(self.config.as_bytes())
             .map_err(TmpPostgrustError::CreateConfigFailed)?;
@@ -385,31 +420,14 @@ impl TmpPostgrustFactory {
             .next_port
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        asynchronous::chown_to_non_root(data_directory_path).await?;
+        asynchronous::chown_to_non_root(dir.path()).await?;
         let mut postgres_process_handle =
-            asynchronous::start_postgres_subprocess(data_directory_path, port)?;
+            asynchronous::start_postgres_subprocess(dir.path(), port)?;
         let stdout = postgres_process_handle.stdout.take().unwrap();
         let stderr = postgres_process_handle.stderr.take().unwrap();
 
-        let stdout_reader = BufReader::new(stdout).lines();
-        let mut stderr_reader = BufReader::new(stderr).lines();
-
-        let (send, recv) = oneshot::channel::<()>();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = postgres_process_handle.wait() => {
-                    tracing::error!("postgresql exited early");
-                }
-                _ = recv => {
-                    signal::kill(
-                        Pid::from_raw(postgres_process_handle.id().unwrap().try_into().unwrap()),
-                        Signal::SIGINT,
-                    )
-                    .unwrap();
-                    postgres_process_handle.wait().await.unwrap();
-                },
-            }
-        });
+        let stdout_reader = tokio::io::BufReader::new(stdout).lines();
+        let mut stderr_reader = tokio::io::BufReader::new(stderr).lines();
 
         while let Some(line) = stderr_reader.next_line().await.unwrap() {
             debug!("Postgresql: {}", line);
@@ -418,31 +436,17 @@ impl TmpPostgrustFactory {
                 break;
             }
         }
-        asynchronous::exec_create_user(self.socket_dir.path(), port, TMP_POSTGRUST_DB_NAME)
-            .await
-            .unwrap();
-        asynchronous::exec_create_db(
-            self.socket_dir.path(),
-            port,
-            TMP_POSTGRUST_DB_NAME,
-            TMP_POSTGRUST_USER_NAME,
-        )
-        .await
-        .unwrap();
 
         Ok(asynchronous::ProcessGuard {
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
-            connection_string: format!(
-                "postgresql:///?host={}&port={}&dbname={}&user={}",
-                self.socket_dir.path().to_str().unwrap(),
-                port,
-                TMP_POSTGRUST_DB_NAME,
-                TMP_POSTGRUST_USER_NAME,
-            ),
-            send_done: Some(send),
-            _data_directory: data_directory,
-            _socket_dir: Arc::clone(&self.socket_dir),
+            port,
+            db_name: TMP_POSTGRUST_DB_NAME.to_string(),
+            user_name: TMP_POSTGRUST_USER_NAME.to_string(),
+            _data_directory: Arc::clone(dir),
+            _cache_directory: Arc::clone(&self.cache_dir),
+            socket_dir: Arc::clone(&self.socket_dir),
+            postgres_process: postgres_process_handle,
             _process_permit: process_permit,
         })
     }
@@ -464,9 +468,9 @@ mod tests {
             .new_instance()
             .expect("failed to create a new instance");
 
-        let (client, conn) = tokio_postgres::connect(&postgresql_proc.connection_string, NoTls)
+        let (client, conn) = tokio_postgres::connect(&postgresql_proc.connection_string(), NoTls)
             .await
-            .unwrap();
+            .expect("failed to connect to postgresql");
 
         tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -489,9 +493,9 @@ mod tests {
             .await
             .expect("failed to create a new instance");
 
-        let (client, conn) = tokio_postgres::connect(&postgresql_proc.connection_string, NoTls)
+        let (client, conn) = tokio_postgres::connect(&postgresql_proc.connection_string(), NoTls)
             .await
-            .unwrap();
+            .expect("failed to connect to postgresql");
 
         tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -514,9 +518,9 @@ mod tests {
             .new_instance()
             .expect("failed to create a new instance");
 
-        let (client1, conn1) = tokio_postgres::connect(&proc1.connection_string, NoTls)
+        let (client1, conn1) = tokio_postgres::connect(&proc1.connection_string(), NoTls)
             .await
-            .unwrap();
+            .expect("failed to connect to postgresql");
 
         tokio::spawn(async move {
             if let Err(e) = conn1.await {
@@ -524,9 +528,9 @@ mod tests {
             }
         });
 
-        let (client2, conn2) = tokio_postgres::connect(&proc2.connection_string, NoTls)
+        let (client2, conn2) = tokio_postgres::connect(&proc2.connection_string(), NoTls)
             .await
-            .unwrap();
+            .expect("failed to connect to postgresql");
 
         tokio::spawn(async move {
             if let Err(e) = conn2.await {
@@ -555,9 +559,9 @@ mod tests {
             .await
             .expect("failed to create a new instance");
 
-        let (client1, conn1) = tokio_postgres::connect(&proc1.connection_string, NoTls)
+        let (client1, conn1) = tokio_postgres::connect(&proc1.connection_string(), NoTls)
             .await
-            .unwrap();
+            .expect("failed to connect to postgresql");
 
         tokio::spawn(async move {
             if let Err(e) = conn1.await {
@@ -565,9 +569,9 @@ mod tests {
             }
         });
 
-        let (client2, conn2) = tokio_postgres::connect(&proc2.connection_string, NoTls)
+        let (client2, conn2) = tokio_postgres::connect(&proc2.connection_string(), NoTls)
             .await
-            .unwrap();
+            .expect("failed to connect to postgresql");
 
         tokio::spawn(async move {
             if let Err(e) = conn2.await {
@@ -584,9 +588,9 @@ mod tests {
     async fn default_process_factory_1() {
         let proc = new_default_process_async().await.unwrap();
 
-        let (client, conn) = tokio_postgres::connect(&proc.connection_string, NoTls)
+        let (client, conn) = tokio_postgres::connect(&proc.connection_string(), NoTls)
             .await
-            .unwrap();
+            .expect("failed to connect to postgresql");
 
         tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -603,9 +607,9 @@ mod tests {
     async fn default_process_factory_2() {
         let proc = new_default_process_async().await.unwrap();
 
-        let (client, conn) = tokio_postgres::connect(&proc.connection_string, NoTls)
+        let (client, conn) = tokio_postgres::connect(&proc.connection_string(), NoTls)
             .await
-            .unwrap();
+            .expect("failed to connect to postgresql");
 
         tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -622,9 +626,9 @@ mod tests {
     async fn default_process_factory_multithread_1() {
         let proc = new_default_process_async().await.unwrap();
 
-        let (client, conn) = tokio_postgres::connect(&proc.connection_string, NoTls)
+        let (client, conn) = tokio_postgres::connect(&proc.connection_string(), NoTls)
             .await
-            .unwrap();
+            .expect("failed to connect to postgresql");
 
         tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -641,9 +645,9 @@ mod tests {
     async fn default_process_factory_multithread_2() {
         let proc = new_default_process_async().await.unwrap();
 
-        let (client, conn) = tokio_postgres::connect(&proc.connection_string, NoTls)
+        let (client, conn) = tokio_postgres::connect(&proc.connection_string(), NoTls)
             .await
-            .unwrap();
+            .expect("failed to connect to postgresql");
 
         tokio::spawn(async move {
             if let Err(e) = conn.await {

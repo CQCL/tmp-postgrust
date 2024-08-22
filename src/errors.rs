@@ -55,6 +55,9 @@ pub enum TmpPostgrustError {
     /// Error when the cache directory cannot be created.
     #[error("failed to create cache directory")]
     CreateCacheDirFailed(#[source] std::io::Error),
+    /// Error when the data directory cannot be created.
+    #[error("failed to create cache directory")]
+    CreateDataDirFailed(#[source] std::io::Error),
     /// Error when `cp` fails for the initialized database.
     #[error("updating directory permission to non-root failed")]
     UpdatingPermissionsFailed(ProcessCapture),

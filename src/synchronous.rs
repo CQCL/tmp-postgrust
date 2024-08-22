@@ -170,17 +170,48 @@ pub struct ProcessGuard {
     pub stdout_reader: Option<Lines<BufReader<ChildStdout>>>,
     /// Allows users to read stderr by line for debugging.
     pub stderr_reader: Option<Lines<BufReader<ChildStderr>>>,
-    /// Connection string for connecting to the temporary postgresql instance.
-    pub connection_string: String,
+    /// Parameters for connecting to the temporary postgresql instance.
+    ///
+    /// A user shouldn't need to use these and should call `connection_string` instead.
+    ///
+    /// Port number that Postgresql is serving on
+    pub port: u32,
+    /// Database name to connect to.
+    pub db_name: String,
+    /// Username to connect as.
+    pub user_name: String,
 
     // Signal that the postgres process should be killed.
     pub(crate) postgres_process: Child,
     // Prevent the data directory from being dropped while
     // the process is running.
     pub(crate) _data_directory: Arc<TempDir>,
-    // Prevent socket directory from being dropped while
+    // Prevent the cache directory from being dropped while
     // the process is running.
-    pub(crate) _socket_dir: Arc<TempDir>,
+    pub(crate) _cache_directory: Arc<TempDir>,
+    /// Socket directory for connection to the running process.
+    pub(crate) socket_dir: Arc<TempDir>,
+}
+
+impl ProcessGuard {
+    /// Get a Postgresql format connection String for the process guard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a string file path cannot be obtained from the socket directory.
+    #[must_use]
+    pub fn connection_string(&self) -> String {
+        format!(
+            "postgresql:///?host={}&port={}&dbname={}&user={}",
+            self.socket_dir
+                .path()
+                .to_str()
+                .expect("Failed to convert socket directory to a path"),
+            self.port,
+            self.db_name,
+            self.user_name,
+        )
+    }
 }
 
 /// Signal that the process needs to end.
