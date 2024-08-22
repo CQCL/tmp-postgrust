@@ -19,7 +19,7 @@ nix = "0.26"
 reflink-copy = "0.1"
 tempfile = "3"
 thiserror = "1.0"
-tokio = { version = "1.39", features = ["parking_lot", "rt", "sync", "io-util", "process", "macros", "fs"], default-features = false, optional = true }
+tokio = { version = "1.8", features = ["parking_lot", "rt", "sync", "io-util", "process", "macros", "fs"], default-features = false, optional = true }
 tracing = "0.1"
 which = "4.0"
 
