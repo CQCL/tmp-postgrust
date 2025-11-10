@@ -20,8 +20,10 @@ mod search;
 pub mod synchronous;
 
 use std::fs::{metadata, set_permissions};
+use std::future::Future;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{fs::File, io::Write};
@@ -165,16 +167,15 @@ pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::Pro
 /// is called.
 #[cfg(feature = "tokio-process")]
 pub async fn new_default_process_async_with_migrations(
-    migrate: impl Fn(&str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    migrate: impl Fn(&str) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>>>,
 ) -> TmpPostgrustResult<asynchronous::ProcessGuard> {
     let factory_mutex = TOKIO_POSTGRES_FACTORY
         .get_or_try_init(|| async {
-            TmpPostgrustFactory::try_new_async().await.map(|factory| {
-                factory
-                    .run_migrations(migrate)
-                    .expect("Failed to run migrations.");
-                tokio::sync::Mutex::new(Some(factory))
-            })
+            let factory = TmpPostgrustFactory::try_new_async().await?;
+            factory
+                .run_migrations_async(migrate)
+                .await?;
+            Ok(tokio::sync::Mutex::new(Some(factory)))
         })
         .await?;
     let guard = factory_mutex.lock().await;
@@ -299,6 +300,24 @@ impl TmpPostgrustFactory {
         let process = self.start_postgresql(&self.cache_dir)?;
 
         migrate(&process.connection_string()).map_err(TmpPostgrustError::MigrationsFailed)?;
+
+        Ok(())
+    }
+
+    /// Run migrations against the cache directory, will cause all subsequent instances
+    /// to be run against a version of the database where the migrations have been applied.
+    ///
+    /// # Errors
+    ///
+    /// Will error if Postgresql is unable to start or if the migrate function returns
+    /// an error.
+    pub async fn run_migrations_async(
+        &self,
+        migrate: impl FnOnce(&str) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>>>,
+    ) -> TmpPostgrustResult<()> {
+        let process = self.start_postgresql(&self.cache_dir)?;
+
+        migrate(&process.connection_string()).await.map_err(TmpPostgrustError::MigrationsFailed)?;
 
         Ok(())
     }
