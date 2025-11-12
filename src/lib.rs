@@ -45,7 +45,9 @@ pub(crate) static POSTGRES_UID_GID: OnceLock<(Uid, Gid)> = OnceLock::new();
 fn cleanup_static() {
     #[cfg(feature = "tokio-process")]
     if let Some(factory_mutex) = TOKIO_POSTGRES_FACTORY.get() {
-        let mut guard = factory_mutex.blocking_lock();
+        let mut guard = factory_mutex
+            .lock()
+            .expect("Failed to lock tokio factory mutex.");
         drop(guard.take());
     }
 
@@ -121,7 +123,7 @@ pub fn new_default_process_with_migrations(
 /// Static factory that can be re-used between tests.
 #[cfg(feature = "tokio-process")]
 static TOKIO_POSTGRES_FACTORY: tokio::sync::OnceCell<
-    tokio::sync::Mutex<Option<TmpPostgrustFactory>>,
+    Mutex<Option<TmpPostgrustFactory>>,
 > = tokio::sync::OnceCell::const_new();
 
 /// Create a new default instance, initializing the `TOKIO_POSTGRES_FACTORY` if it
@@ -141,10 +143,12 @@ pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::Pro
         .get_or_try_init(|| async {
             TmpPostgrustFactory::try_new_async()
                 .await
-                .map(|factory| tokio::sync::Mutex::new(Some(factory)))
+                .map(|factory| Mutex::new(Some(factory)))
         })
         .await?;
-    let guard = factory_mutex.lock().await;
+    let guard = factory_mutex
+        .lock()
+        .expect("Failed to lock tokio factory mutex.");
     let factory = guard
         .as_ref()
         .expect("Default tokio factory is uninitialized or has been dropped.");
@@ -176,10 +180,12 @@ where
             factory
                 .run_migrations_async(migrate)
                 .await?;
-            Ok(tokio::sync::Mutex::new(Some(factory)))
+            Ok(Mutex::new(Some(factory)))
         })
         .await?;
-    let guard = factory_mutex.lock().await;
+    let guard = factory_mutex
+        .lock()
+        .expect("Failed to lock tokio factory mutex.");
     let factory = guard
         .as_ref()
         .expect("Default tokio factory is uninitialized or has been dropped.");
