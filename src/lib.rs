@@ -23,7 +23,6 @@ use std::fs::{metadata, set_permissions};
 use std::future::Future;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::{fs::File, io::Write};
@@ -166,9 +165,12 @@ pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::Pro
 /// Will panic if a `TmpPostgrustFactory::try_new_async` returns an error the first time the function
 /// is called.
 #[cfg(feature = "tokio-process")]
-pub async fn new_default_process_async_with_migrations(
-    migrate: impl Fn(&str) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>>>,
-) -> TmpPostgrustResult<asynchronous::ProcessGuard> {
+pub async fn new_default_process_async_with_migrations<F>(
+    migrate: impl Fn(&str) -> F,
+) -> TmpPostgrustResult<asynchronous::ProcessGuard>
+where
+    F: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+{
     let factory_mutex = TOKIO_POSTGRES_FACTORY
         .get_or_try_init(|| async {
             let factory = TmpPostgrustFactory::try_new_async().await?;
@@ -311,10 +313,13 @@ impl TmpPostgrustFactory {
     ///
     /// Will error if Postgresql is unable to start or if the migrate function returns
     /// an error.
-    pub async fn run_migrations_async(
+    pub async fn run_migrations_async<F>(
         &self,
-        migrate: impl FnOnce(&str) -> Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>>>,
-    ) -> TmpPostgrustResult<()> {
+        migrate: impl FnOnce(&str) -> F,
+    ) -> TmpPostgrustResult<()>
+    where
+        F: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    {
         let process = self.start_postgresql(&self.cache_dir)?;
 
         migrate(&process.connection_string()).await.map_err(TmpPostgrustError::MigrationsFailed)?;
