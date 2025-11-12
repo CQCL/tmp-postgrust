@@ -21,7 +21,7 @@ use crate::search::{all_dir_entries, build_copy_dst_path, find_postgresql_comman
 use crate::POSTGRES_UID_GID;
 
 /// Limit the total processes that can be running at any one time.
-pub(crate) static MAX_CONCURRENT_PROCESSES: Semaphore = Semaphore::const_new(8);
+pub(crate) static MAX_CONCURRENT_PROCESSES: Semaphore = Semaphore::const_new(64);
 
 #[instrument(skip(command, fail))]
 async fn exec_process(
