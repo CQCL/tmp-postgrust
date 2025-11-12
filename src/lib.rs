@@ -20,7 +20,6 @@ mod search;
 pub mod synchronous;
 
 use std::fs::{metadata, set_permissions};
-use std::future::Future;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::atomic::AtomicU32;
@@ -166,10 +165,10 @@ pub async fn new_default_process_async() -> TmpPostgrustResult<asynchronous::Pro
 /// is called.
 #[cfg(feature = "tokio-process")]
 pub async fn new_default_process_async_with_migrations<F>(
-    migrate: impl Fn(&str) -> F,
+    migrate: F,
 ) -> TmpPostgrustResult<asynchronous::ProcessGuard>
 where
-    F: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
+    F: for<'r> Fn(&'r str) -> futures::future::BoxFuture<'r, Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 {
     let factory_mutex = TOKIO_POSTGRES_FACTORY
         .get_or_try_init(|| async {
@@ -313,12 +312,13 @@ impl TmpPostgrustFactory {
     ///
     /// Will error if Postgresql is unable to start or if the migrate function returns
     /// an error.
+    #[cfg(feature = "tokio-process")]
     pub async fn run_migrations_async<F>(
         &self,
-        migrate: impl Fn(&str) -> F,
+        migrate: F,
     ) -> TmpPostgrustResult<()>
     where
-        F: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
+        F: for<'r> Fn(&'r str) -> futures::future::BoxFuture<'r, Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     {
         let process = self.start_postgresql(&self.cache_dir)?;
 
