@@ -168,7 +168,7 @@ pub async fn new_default_process_async_with_migrations<F>(
     migrate: F,
 ) -> TmpPostgrustResult<asynchronous::ProcessGuard>
 where
-    F: for<'r> Fn(&'r str) -> futures::future::BoxFuture<'r, Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    F: for<'r> Fn(&'r str) -> futures_util::future::BoxFuture<'r, Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 {
     let factory_mutex = TOKIO_POSTGRES_FACTORY
         .get_or_try_init(|| async {
@@ -318,7 +318,7 @@ impl TmpPostgrustFactory {
         migrate: F,
     ) -> TmpPostgrustResult<()>
     where
-        F: for<'r> Fn(&'r str) -> futures::future::BoxFuture<'r, Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+        F: for<'r> Fn(&'r str) -> futures_util::future::BoxFuture<'r, Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     {
         let process = self.start_postgresql(&self.cache_dir)?;
 

@@ -22,7 +22,7 @@ thiserror = "1.0"
 tokio = { version = "1.8", features = ["parking_lot", "rt", "sync", "io-util", "process", "macros", "fs"], default-features = false, optional = true }
 tracing = "0.1"
 which = "4.0"
-futures = { version = "0.3", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 test-log = { version = "0.2", default-features = false, features = ["trace"] }
@@ -32,4 +32,4 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 
 [features]
 default = []
-tokio-process = ["tokio", "futures"]
+tokio-process = ["tokio", "futures-util"]
