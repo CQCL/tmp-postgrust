@@ -297,7 +297,7 @@ impl TmpPostgrustFactory {
     /// an error.
     pub fn run_migrations(
         &self,
-        migrate: impl FnOnce(&str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+        migrate: impl Fn(&str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     ) -> TmpPostgrustResult<()> {
         let process = self.start_postgresql(&self.cache_dir)?;
 
@@ -315,7 +315,7 @@ impl TmpPostgrustFactory {
     /// an error.
     pub async fn run_migrations_async<F>(
         &self,
-        migrate: impl FnOnce(&str) -> F,
+        migrate: impl Fn(&str) -> F,
     ) -> TmpPostgrustResult<()>
     where
         F: Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
